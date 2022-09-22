@@ -276,6 +276,10 @@ struct _GstDecodebin3Class
 
     gint (*select_stream) (GstDecodebin3 * dbin,
       GstStreamCollection * collection, GstStream * stream);
+
+  /* signal fired to know if we continue trying to decode the given caps */
+    gboolean (*autoplug_continue) (GstElement * element, GstPad * pad,
+      GstCaps * caps);
 };
 
 /* Input of decodebin, controls input pad and parsebin */
@@ -386,6 +390,7 @@ enum
 {
   SIGNAL_SELECT_STREAM,
   SIGNAL_ABOUT_TO_FINISH,
+  SIGNAL_AUTOPLUG_CONTINUE,
   LAST_SIGNAL
 };
 static guint gst_decodebin3_signals[LAST_SIGNAL] = { 0 };
@@ -532,6 +537,19 @@ static void update_requested_selection (GstDecodebin3 * dbin);
 #include "gstdecodebin3-parse.c"
 
 static gboolean
+_gst_boolean_accumulator (GSignalInvocationHint * ihint,
+    GValue * return_accu, const GValue * handler_return, gpointer dummy)
+{
+  gboolean myboolean;
+
+  myboolean = g_value_get_boolean (handler_return);
+  g_value_set_boolean (return_accu, myboolean);
+
+  /* stop emission if FALSE */
+  return myboolean;
+}
+
+static gboolean
 _gst_int_accumulator (GSignalInvocationHint * ihint,
     GValue * return_accu, const GValue * handler_return, gpointer dummy)
 {
@@ -543,6 +561,16 @@ _gst_int_accumulator (GSignalInvocationHint * ihint,
     return TRUE;
 
   return FALSE;
+}
+
+static gboolean
+gst_decodebin3_autoplug_continue (GstElement * element, GstPad * pad,
+    GstCaps * caps)
+{
+  GST_DEBUG_OBJECT (element, "autoplug-continue returns TRUE");
+
+  /* by default we always continue */
+  return TRUE;
 }
 
 static void
@@ -595,6 +623,29 @@ gst_decodebin3_class_init (GstDecodebin3Class * klass)
       g_signal_new ("about-to-finish", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 0, G_TYPE_NONE);
 
+  /**
+   * GstDecodeBin3::autoplug-continue:
+   * @bin: The decodebin.
+   * @pad: The #GstPad.
+   * @caps: The #GstCaps found.
+   *
+   * This signal is emitted whenever decodebin finds a new stream. It is
+   * emitted before looking for any elements that can handle that stream.
+   *
+   * >   Invocation of signal handlers stops after the first signal handler
+   * >   returns %FALSE. Signal handlers are invoked in the order they were
+   * >   connected in.
+   *
+   * Returns: %TRUE if you wish decodebin3 to look for elements that can
+   * handle the given @caps. If %FALSE, those caps will be considered as
+   * final and the pad will be exposed as such (see 'pad-added' signal of
+   * #GstElement).
+   */
+  gst_decodebin3_signals[SIGNAL_AUTOPLUG_CONTINUE] =
+      g_signal_new ("autoplug-continue", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstDecodebin3Class,
+          autoplug_continue), _gst_boolean_accumulator, NULL, NULL,
+      G_TYPE_BOOLEAN, 2, GST_TYPE_PAD, GST_TYPE_CAPS);
 
   element_class->request_new_pad =
       GST_DEBUG_FUNCPTR (gst_decodebin3_request_new_pad);
@@ -622,6 +673,9 @@ gst_decodebin3_class_init (GstDecodebin3Class * klass)
   bin_klass->handle_message = gst_decodebin3_handle_message;
 
   klass->select_stream = gst_decodebin3_select_stream;
+
+  klass->autoplug_continue =
+      GST_DEBUG_FUNCPTR (gst_decodebin3_autoplug_continue);
 }
 
 static void
@@ -722,10 +776,40 @@ gst_decodebin3_get_property (GObject * object, guint prop_id, GValue * value,
 }
 
 static gboolean
+gst_decodebin3_proccess_autoplug_continue (GstDecodebin3 * dbin,
+    GstPad * pad, GstCaps * caps)
+{
+  gboolean apcontinue = TRUE;
+
+  g_signal_emit (G_OBJECT (dbin),
+      gst_decodebin3_signals[SIGNAL_AUTOPLUG_CONTINUE], 0, pad, caps,
+      &apcontinue);
+
+  GST_DEBUG_OBJECT (dbin,
+      "Emitted autoplug-continue for caps (%" GST_PTR_FORMAT ") returns %d",
+      caps, apcontinue);
+
+  if (!apcontinue) {
+    /* If the user have decided to stop autoplugging,
+     * we also resetup the target caps */
+    if (!gst_caps_can_intersect (caps, dbin->caps)) {
+      g_object_set (dbin, "caps", caps, NULL);
+    }
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
 parsebin_autoplug_continue_cb (GstElement * parsebin, GstPad * pad,
     GstCaps * caps, GstDecodebin3 * dbin)
 {
   GST_DEBUG_OBJECT (pad, "caps %" GST_PTR_FORMAT, caps);
+
+  if (!gst_decodebin3_proccess_autoplug_continue (dbin, pad, caps)) {
+    return FALSE;
+  }
 
   /* If it matches our target caps, expose it */
   if (gst_caps_can_intersect (caps, dbin->caps))
@@ -2487,6 +2571,7 @@ reconfigure_output_stream (DecodebinOutputStream * output,
         gst_bin_remove ((GstBin *) dbin, output->decoder);
         output->decoder = NULL;
       }
+
       next_factory = next_factory->next;
     }
     gst_plugin_feature_list_free (factories);
@@ -2495,6 +2580,19 @@ reconfigure_output_stream (DecodebinOutputStream * output,
     output->decoder_sink = NULL;
   }
   gst_caps_unref (new_caps);
+
+  if (output->decoder) {
+    GstCaps *caps;
+
+    caps = gst_pad_get_pad_template_caps (output->decoder_src);
+    if (G_LIKELY (caps)) {
+      /* Result of autoplug-continue is ignored because this pad
+       * is going to be exposed anyway. */
+      gst_decodebin3_proccess_autoplug_continue (dbin, output->decoder_src,
+          caps);
+      gst_caps_unref (caps);
+    }
+  }
 
   output->linked = TRUE;
   if (!gst_ghost_pad_set_target ((GstGhostPad *) output->src_pad,
