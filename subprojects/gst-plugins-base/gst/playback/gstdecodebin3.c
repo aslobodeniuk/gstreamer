@@ -740,6 +740,10 @@ gst_decodebin3_dispose (GObject * object)
     dbin->parsebin_pads_exposed = NULL;
   }
 
+  g_mutex_clear (&dbin->factories_lock);
+  g_mutex_clear (&dbin->selection_lock);
+  g_mutex_clear (&dbin->input_lock);
+
   G_OBJECT_CLASS (parent_class)->dispose (object);
 }
 
