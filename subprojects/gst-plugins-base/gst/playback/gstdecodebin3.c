@@ -230,6 +230,7 @@ struct _GstDecodebin3
   GList *output_streams;        /* List of DecodebinOutputStream used for output */
   GList *slots;                 /* List of MultiQueueSlot */
   guint slot_id;
+  GSList *parsebin_pads_exposed;
 
   /* Active collection */
   GstStreamCollection *collection;
@@ -732,6 +733,13 @@ gst_decodebin3_dispose (GObject * object)
     dbin->other_inputs = g_list_delete_link (dbin->other_inputs, walk);
   }
 
+  if (g_slist_length (dbin->parsebin_pads_exposed)) {
+    g_critical ("failed sanity check: not all the exposed pads "
+        "have been removed");
+    g_slist_free_full (dbin->parsebin_pads_exposed, gst_object_unref);
+    dbin->parsebin_pads_exposed = NULL;
+  }
+
   G_OBJECT_CLASS (parent_class)->dispose (object);
 }
 
@@ -776,10 +784,12 @@ gst_decodebin3_get_property (GObject * object, guint prop_id, GValue * value,
 }
 
 static gboolean
-gst_decodebin3_proccess_autoplug_continue (GstDecodebin3 * dbin,
-    GstPad * pad, GstCaps * caps)
+parsebin_autoplug_continue_cb (GstElement * parsebin, GstPad * pad,
+    GstCaps * caps, GstDecodebin3 * dbin)
 {
   gboolean apcontinue = TRUE;
+
+  GST_DEBUG_OBJECT (pad, "caps %" GST_PTR_FORMAT, caps);
 
   g_signal_emit (G_OBJECT (dbin),
       gst_decodebin3_signals[SIGNAL_AUTOPLUG_CONTINUE], 0, pad, caps,
@@ -790,24 +800,10 @@ gst_decodebin3_proccess_autoplug_continue (GstDecodebin3 * dbin,
       caps, apcontinue);
 
   if (!apcontinue) {
-    /* If the user have decided to stop autoplugging,
-     * we also resetup the target caps */
-    if (!gst_caps_can_intersect (caps, dbin->caps)) {
-      g_object_set (dbin, "caps", caps, NULL);
-    }
-    return FALSE;
-  }
-
-  return TRUE;
-}
-
-static gboolean
-parsebin_autoplug_continue_cb (GstElement * parsebin, GstPad * pad,
-    GstCaps * caps, GstDecodebin3 * dbin)
-{
-  GST_DEBUG_OBJECT (pad, "caps %" GST_PTR_FORMAT, caps);
-
-  if (!gst_decodebin3_proccess_autoplug_continue (dbin, pad, caps)) {
+    SELECTION_LOCK (dbin);
+    dbin->parsebin_pads_exposed = g_slist_append (dbin->parsebin_pads_exposed,
+        gst_object_ref (pad));
+    SELECTION_UNLOCK (dbin);
     return FALSE;
   }
 
@@ -2409,15 +2405,60 @@ keyframe_waiter_probe (GstPad * pad, GstPadProbeInfo * info,
   return GST_PAD_PROBE_DROP;
 }
 
+static gboolean
+slot_is_to_be_exposed (MultiQueueSlot * slot)
+{
+  GstDecodebin3 *dbin = slot->dbin;
+  gboolean done = FALSE;
+  GValue item = G_VALUE_INIT;
+  gboolean ret = FALSE;
+  GstIterator *it;
+
+  it = gst_element_iterate_src_pads (slot->input->input->parsebin);
+
+  while (!done) {
+    GstPad *srcpad;
+
+    switch (gst_iterator_next (it, &item)) {
+      case GST_ITERATOR_OK:
+        srcpad = g_value_get_object (&item);
+
+        if (g_slist_find (dbin->parsebin_pads_exposed, srcpad)) {
+          ret = TRUE;
+          done = TRUE;
+        }
+
+        g_value_reset (&item);
+        break;
+      case GST_ITERATOR_DONE:
+        done = TRUE;
+        break;
+      case GST_ITERATOR_RESYNC:
+        gst_iterator_resync (it);
+        break;
+      case GST_ITERATOR_ERROR:
+        done = TRUE;
+        break;
+    }
+  }
+  g_value_unset (&item);
+  gst_iterator_free (it);
+
+  return ret;
+}
+
 static void
 reconfigure_output_stream (DecodebinOutputStream * output,
     MultiQueueSlot * slot)
 {
   GstDecodebin3 *dbin = output->dbin;
   GstCaps *new_caps = (GstCaps *) gst_stream_get_caps (slot->active_stream);
-  gboolean needs_decoder;
+  gboolean needs_decoder = TRUE;
 
-  needs_decoder = gst_caps_can_intersect (new_caps, dbin->caps) != TRUE;
+  needs_decoder = !slot_is_to_be_exposed (slot);
+  if (needs_decoder) {
+    needs_decoder = gst_caps_can_intersect (new_caps, dbin->caps) != TRUE;
+  }
 
   GST_DEBUG_OBJECT (dbin,
       "Reconfiguring output %p to slot %p, needs_decoder:%d", output, slot,
@@ -2588,8 +2629,16 @@ reconfigure_output_stream (DecodebinOutputStream * output,
     if (G_LIKELY (caps)) {
       /* Result of autoplug-continue is ignored because this pad
        * is going to be exposed anyway. */
-      gst_decodebin3_proccess_autoplug_continue (dbin, output->decoder_src,
-          caps);
+      gboolean apcontinue = TRUE;
+
+      g_signal_emit (G_OBJECT (dbin),
+          gst_decodebin3_signals[SIGNAL_AUTOPLUG_CONTINUE], 0,
+          output->decoder_src, caps, &apcontinue);
+
+      GST_DEBUG_OBJECT (dbin,
+          "Emitted autoplug-continue for caps (%" GST_PTR_FORMAT ") returns %d",
+          caps, apcontinue);
+
       gst_caps_unref (caps);
     }
   }
