@@ -2451,6 +2451,95 @@ slot_is_to_be_exposed (MultiQueueSlot * slot)
   return ret;
 }
 
+/* Requires SELECTION_LOCK to be taken */
+static gboolean
+input_has_slot (const GstDecodebin3 * dbin, const DecodebinInput * inp)
+{
+  GList *l;
+
+  for (l = dbin->slots; l != NULL; l = l->next) {
+    MultiQueueSlot *slot = (MultiQueueSlot *) l->data;
+
+    if (!slot->input || !slot->input->input) {
+      continue;
+    }
+
+    if (slot->input->input != inp) {
+      continue;
+    }
+
+    if (slot->output == NULL || !slot->output->src_exposed) {
+      continue;
+    }
+
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/* Requires SELECTION_LOCK to be taken */
+static gboolean
+dbin_is_complete (GstDecodebin3 * dbin)
+{
+  GList *l;
+  gboolean is_complete = FALSE;
+
+  if (dbin->main_input->pending_pads) {
+    return FALSE;
+  }
+
+  g_object_get (dbin->main_input->parsebin, "chains-completed",
+      &is_complete, NULL);
+
+  if (!is_complete) {
+    return FALSE;
+  }
+
+  if (!input_has_slot (dbin, dbin->main_input)) {
+    return FALSE;
+  }
+
+  for (l = dbin->other_inputs; l != NULL; l = l->next) {
+    DecodebinInput *aux = (DecodebinInput *) l->data;
+    gboolean aux_complete = FALSE;
+
+    if (aux->pending_pads) {
+      return FALSE;
+    }
+
+    g_object_get (aux->parsebin, "chains-completed", &aux_complete, NULL);
+
+    if (!aux_complete) {
+      return FALSE;
+    }
+
+    if (!input_has_slot (dbin, aux)) {
+      return FALSE;
+    }
+  }
+
+  /* Every input should have slot, every slot should have input */
+  for (l = dbin->slots; l != NULL; l = l->next) {
+    MultiQueueSlot *slot = (MultiQueueSlot *) l->data;
+
+    if (!slot->input || !slot->input->input) {
+      return FALSE;
+    }
+
+    if (slot->input->input != dbin->main_input &&
+        !g_list_find (dbin->other_inputs, slot->input->input)) {
+      return FALSE;
+    }
+
+    if (slot->output == NULL || !slot->output->src_exposed) {
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
 static void
 reconfigure_output_stream (DecodebinOutputStream * output,
     MultiQueueSlot * slot)
@@ -2654,6 +2743,7 @@ reconfigure_output_stream (DecodebinOutputStream * output,
     goto cleanup;
   }
   if (output->src_exposed == FALSE) {
+    gboolean is_the_last_pad = FALSE;
     GstEvent *stream_start;
 
     stream_start = gst_pad_get_sticky_event (slot->src_pad,
@@ -2669,7 +2759,15 @@ reconfigure_output_stream (DecodebinOutputStream * output,
     }
 
     output->src_exposed = TRUE;
+
+    is_the_last_pad = dbin_is_complete (dbin);
     gst_element_add_pad (GST_ELEMENT_CAST (dbin), output->src_pad);
+    if (is_the_last_pad) {
+      GST_DEBUG_OBJECT (dbin,
+          "Pad %" GST_PTR_FORMAT ". Considered to be the last pad."
+          " Emit no-more-pads", output->src_pad);
+      gst_element_no_more_pads (GST_ELEMENT_CAST (dbin));
+    }
   }
 
   if (output->decoder)
