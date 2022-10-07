@@ -223,6 +223,7 @@ struct _GstURIDecodeBin3
   gulong db_select_stream_id;
   gulong db_about_to_finish_id;
   gulong db_autoplug_continue_id;
+  gulong db_no_more_pads_id;
 
   GList *output_pads;           /* List of OutputPad */
 
@@ -715,6 +716,11 @@ db_autoplug_continue_cb (GstElement * decodebin, GstPad * pad,
   return result;
 }
 
+static void
+db_no_more_pads_cb (GstElement * gstelement, GstURIDecodeBin3 * dec)
+{
+  gst_element_no_more_pads (GST_ELEMENT_CAST (dec));
+}
 
 static void
 gst_uri_decode_bin3_init (GstURIDecodeBin3 * dec)
@@ -748,6 +754,9 @@ gst_uri_decode_bin3_init (GstURIDecodeBin3 * dec)
   dec->db_autoplug_continue_id =
       g_signal_connect (dec->decodebin, "autoplug-continue",
       G_CALLBACK (db_autoplug_continue_cb), dec);
+  dec->db_no_more_pads_id =
+      g_signal_connect (dec->decodebin, "no-more-pads",
+      G_CALLBACK (db_no_more_pads_cb), dec);
 
   GST_OBJECT_FLAG_SET (dec, GST_ELEMENT_FLAG_SOURCE);
   gst_bin_set_suppressed_flags (GST_BIN (dec),
