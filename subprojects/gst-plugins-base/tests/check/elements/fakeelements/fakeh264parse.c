@@ -18,7 +18,6 @@
  */
 
 /* Included into decodebin3.c */
-
 /* Fake h264 parser/decoder for decodebin3 parser_negotiation test */
 static GType gst_fake_h264_parser_get_type (void);
 static GType gst_fake_h264_decoder_get_type (void);
@@ -88,6 +87,22 @@ gst_fake_h264_parser_sink_event (GstPad * pad, GstObject * parent,
   return ret;
 }
 
+static void
+fake_element_take_time (void)
+{
+  static const gulong fake_element_timings_deviation_ms = 10;
+  static gboolean once;
+  static gboolean element_is_fast;
+  if (!once) {
+    g_random_set_seed (g_get_monotonic_time ());
+    element_is_fast = g_random_int_range (0, 1);
+  }
+
+  if (!element_is_fast) {
+    g_usleep (G_TIME_SPAN_MILLISECOND * fake_element_timings_deviation_ms);
+  }
+}
+
 static GstFlowReturn
 gst_fake_h264_parser_sink_chain (GstPad * pad, GstObject * parent,
     GstBuffer * buf)
@@ -97,6 +112,8 @@ gst_fake_h264_parser_sink_chain (GstPad * pad, GstObject * parent,
   GstFlowReturn ret = GST_FLOW_OK;
 
   buf = gst_buffer_make_writable (buf);
+
+  fake_element_take_time ();
 
   ret = gst_pad_push (otherpad, buf);
 
@@ -187,6 +204,8 @@ gst_fake_h264_decoder_sink_chain (GstPad * pad, GstObject * parent,
   GstFlowReturn ret = GST_FLOW_OK;
 
   buf = gst_buffer_make_writable (buf);
+
+  fake_element_take_time ();
 
   ret = gst_pad_push (otherpad, buf);
 

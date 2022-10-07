@@ -152,6 +152,8 @@ gst_fake_tsdemux_sink_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
         "audio_src");
     gst_element_add_pad (GST_ELEMENT (self), self->audio_pad);
 
+    gst_element_no_more_pads (GST_ELEMENT (self));
+
     gst_pad_push_event (self->audio_pad, gst_event_new_stream_start ("audio"));
     caps =
         gst_caps_new_simple ("audio/mpeg", "mpegversion", G_TYPE_INT, 4, NULL);
